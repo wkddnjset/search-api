@@ -17,7 +17,7 @@ interface RawSearchResult {
   language?: string;
 }
 
-// --- DuckDuckGo HTML Adapter (real web search, no API key needed) ---
+// --- DuckDuckGo Adapter (real web search, no API key needed) ---
 
 const DDG_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -26,29 +26,116 @@ const DDG_HEADERS = {
   'Referer': 'https://duckduckgo.com/',
 };
 
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .trim();
+}
+
 class DuckDuckGoSearchEngine implements SearchEngine {
   async search(query: WebSearchQuery): Promise<RawSearchResult[]> {
+    // 1st: DDG internal JSON API (works best from serverless/datacenter IPs)
+    let results = await this.searchApi(query);
+    if (results.length > 0) return results.slice(0, query.count);
+
+    // 2nd: Lite HTML endpoint
+    const htmlParams = this.buildHtmlParams(query);
+    results = await this.searchLite(htmlParams, query.count);
+    if (results.length > 0) return results;
+
+    // 3rd: Full HTML endpoint
+    results = await this.searchHtml(htmlParams, query.count);
+    return results;
+  }
+
+  private buildHtmlParams(query: WebSearchQuery): URLSearchParams {
     const params = new URLSearchParams();
     params.set('q', query.q);
     if (query.search_lang) params.set('kl', query.search_lang);
-
     const safesearchMap = { off: '-2', moderate: '-1', strict: '1' } as const;
     params.set('kp', safesearchMap[query.safesearch]);
-
     if (query.freshness) {
       const freshnessMap: Record<string, string> = { pd: 'd', pw: 'w', pm: 'm', py: 'y' };
       params.set('df', freshnessMap[query.freshness] || '');
     }
-
-    // Try lite endpoint first (works better from serverless/datacenter IPs)
-    let results = await this.searchLite(params, query.count);
-    if (results.length > 0) return results;
-
-    // Fallback to html endpoint
-    results = await this.searchHtml(params, query.count);
-    return results;
+    return params;
   }
 
+  // --- Primary: DDG JSON API via vqd token ---
+  private async searchApi(query: WebSearchQuery): Promise<RawSearchResult[]> {
+    try {
+      // Step 1: Get vqd token
+      const tokenRes = await fetch('https://duckduckgo.com/', {
+        method: 'POST',
+        headers: {
+          ...DDG_HEADERS,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: `q=${encodeURIComponent(query.q)}`,
+      });
+      if (!tokenRes.ok) return [];
+
+      const tokenText = await tokenRes.text();
+      const vqdMatch = tokenText.match(/vqd=["']?(\d[\d-]+\d)["']?/);
+      if (!vqdMatch) return [];
+
+      // Step 2: Fetch results from d.js endpoint
+      const params = new URLSearchParams();
+      params.set('q', query.q);
+      params.set('vqd', vqdMatch[1]);
+      params.set('kl', query.search_lang || 'wt-wt');
+      params.set('l', query.search_lang || 'wt-wt');
+      params.set('p', '');
+      params.set('s', String(query.offset * query.count));
+      params.set('ex', '-1');
+      params.set('sp', '0');
+      params.set('o', 'json');
+      if (query.freshness) {
+        const freshnessMap: Record<string, string> = { pd: 'd', pw: 'w', pm: 'm', py: 'y' };
+        params.set('df', freshnessMap[query.freshness] || '');
+      }
+
+      const res = await fetch(`https://links.duckduckgo.com/d.js?${params}`, {
+        headers: {
+          ...DDG_HEADERS,
+          'Accept': 'application/json, text/javascript, */*; q=0.01',
+          'Referer': 'https://duckduckgo.com/',
+        },
+      });
+      if (!res.ok) return [];
+
+      const data = await res.json();
+      const results: RawSearchResult[] = [];
+
+      // d.js returns { results: [{a, t, c, d, s, ...}] }
+      const items = data.results || data;
+      if (!Array.isArray(items)) return [];
+
+      for (const item of items) {
+        // Skip ads and non-result entries
+        if (!item.u || !item.t || item.n) continue;
+
+        results.push({
+          title: decodeHtmlEntities(item.t),
+          url: item.u,
+          snippet: decodeHtmlEntities(item.a || ''),
+        });
+      }
+
+      return results;
+    } catch {
+      return [];
+    }
+  }
+
+  // --- Fallback: Lite HTML ---
   private async searchLite(params: URLSearchParams, count: number): Promise<RawSearchResult[]> {
     try {
       const res = await fetch('https://lite.duckduckgo.com/lite/', {
@@ -58,91 +145,74 @@ class DuckDuckGoSearchEngine implements SearchEngine {
       });
       if (!res.ok) return [];
       const html = await res.text();
-      return this.parseLiteResults(html, count);
+
+      const results: RawSearchResult[] = [];
+      const linkRegex = /<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+      const snippetRegex = /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+
+      const links: { url: string; title: string }[] = [];
+      let match;
+      while ((match = linkRegex.exec(html)) !== null && links.length < count) {
+        links.push({ url: match[1], title: decodeHtmlEntities(match[2]) });
+      }
+
+      const snippets: string[] = [];
+      while ((match = snippetRegex.exec(html)) !== null) {
+        snippets.push(decodeHtmlEntities(match[1]));
+      }
+
+      for (let i = 0; i < links.length && results.length < count; i++) {
+        let url = links[i].url;
+        if (url.startsWith('//duckduckgo.com/l/?')) {
+          const uddg = new URLSearchParams(url.replace('//duckduckgo.com/l/?', '')).get('uddg');
+          if (uddg) url = decodeURIComponent(uddg);
+        }
+        if (!url.startsWith('http')) continue;
+        results.push({ title: links[i].title, url, snippet: snippets[i] || '' });
+      }
+      return results;
     } catch {
       return [];
     }
   }
 
+  // --- Fallback: Full HTML ---
   private async searchHtml(params: URLSearchParams, count: number): Promise<RawSearchResult[]> {
-    const res = await fetch('https://html.duckduckgo.com/html/', {
-      method: 'POST',
-      headers: { ...DDG_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-    if (!res.ok) {
-      throw new Error(`DuckDuckGo error: ${res.status} ${res.statusText}`);
-    }
-    const html = await res.text();
-    return this.parseHtmlResults(html, count);
-  }
-
-  private parseLiteResults(html: string, count: number): RawSearchResult[] {
-    const results: RawSearchResult[] = [];
-
-    // Lite version uses table rows: link in one row, snippet in next
-    // Pattern: <a rel="nofollow" href="URL" class="result-link">TITLE</a>
-    const linkRegex = /<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    const snippetRegex = /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
-
-    const links: { url: string; title: string }[] = [];
-    let match;
-    while ((match = linkRegex.exec(html)) !== null && links.length < count) {
-      links.push({
-        url: match[1],
-        title: match[2].replace(/<[^>]+>/g, '').trim(),
+    try {
+      const res = await fetch('https://html.duckduckgo.com/html/', {
+        method: 'POST',
+        headers: { ...DDG_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
       });
-    }
+      if (!res.ok) return [];
+      const html = await res.text();
 
-    const snippets: string[] = [];
-    while ((match = snippetRegex.exec(html)) !== null) {
-      snippets.push(match[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").trim());
-    }
+      const results: RawSearchResult[] = [];
+      const resultBlocks = html.split('class="result results_links');
 
-    for (let i = 0; i < links.length && results.length < count; i++) {
-      let url = links[i].url;
-      if (url.startsWith('//duckduckgo.com/l/?')) {
-        const uddg = new URLSearchParams(url.replace('//duckduckgo.com/l/?', '')).get('uddg');
-        if (uddg) url = decodeURIComponent(uddg);
-      }
-      if (!url.startsWith('http')) continue;
+      for (let i = 1; i < resultBlocks.length && results.length < count; i++) {
+        const block = resultBlocks[i];
+        const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/);
+        const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)/);
+        const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
 
-      results.push({
-        title: links[i].title,
-        url,
-        snippet: snippets[i] || '',
-      });
-    }
-
-    return results;
-  }
-
-  private parseHtmlResults(html: string, count: number): RawSearchResult[] {
-    const results: RawSearchResult[] = [];
-    const resultBlocks = html.split('class="result results_links');
-
-    for (let i = 1; i < resultBlocks.length && results.length < count; i++) {
-      const block = resultBlocks[i];
-      const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/);
-      const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)/);
-      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-
-      if (urlMatch && titleMatch) {
-        let url = urlMatch[1];
-        if (url.startsWith('//duckduckgo.com/l/?')) {
-          const uddg = new URLSearchParams(url.replace('//duckduckgo.com/l/?', '')).get('uddg');
-          if (uddg) url = decodeURIComponent(uddg);
+        if (urlMatch && titleMatch) {
+          let url = urlMatch[1];
+          if (url.startsWith('//duckduckgo.com/l/?')) {
+            const uddg = new URLSearchParams(url.replace('//duckduckgo.com/l/?', '')).get('uddg');
+            if (uddg) url = decodeURIComponent(uddg);
+          }
+          results.push({
+            title: titleMatch[1].trim(),
+            url,
+            snippet: snippetMatch ? decodeHtmlEntities(snippetMatch[1]) : '',
+          });
         }
-
-        const snippet = snippetMatch
-          ? snippetMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x27;/g, "'").trim()
-          : '';
-
-        results.push({ title: titleMatch[1].trim(), url, snippet });
       }
+      return results;
+    } catch {
+      return [];
     }
-
-    return results;
   }
 }
 
