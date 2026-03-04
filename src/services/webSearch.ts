@@ -37,14 +37,7 @@ function decodeHtmlEntities(str: string): string {
 // --- DuckDuckGo Adapter with cookie handling + Bing fallback ---
 
 class DuckDuckGoSearchEngine implements SearchEngine {
-  private debugLog: string[] = [];
-
-  getDebugLog(): string[] {
-    return this.debugLog;
-  }
-
   async search(query: WebSearchQuery): Promise<RawSearchResult[]> {
-    this.debugLog = [];
 
     // 1st: DDG JSON API with cookies
     let results = await this.searchDdgApi(query);
@@ -76,7 +69,7 @@ class DuckDuckGoSearchEngine implements SearchEngine {
       });
 
       if (!initRes.ok) {
-        this.debugLog.push(`ddg-api: init ${initRes.status}`);
+
         return [];
       }
 
@@ -87,7 +80,6 @@ class DuckDuckGoSearchEngine implements SearchEngine {
       const html = await initRes.text();
       const vqdMatch = html.match(/vqd=['"]?([\d][\d-]+[\d])['"]?/);
       if (!vqdMatch) {
-        this.debugLog.push(`ddg-api: no vqd found (html length: ${html.length})`);
         return [];
       }
 
@@ -113,17 +105,11 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         },
       });
 
-      if (!res.ok) {
-        this.debugLog.push(`ddg-api: d.js ${res.status}`);
-        return [];
-      }
+      if (!res.ok) return [];
 
       const data = await res.json();
       const items = data.results || data;
-      if (!Array.isArray(items)) {
-        this.debugLog.push(`ddg-api: not array`);
-        return [];
-      }
+      if (!Array.isArray(items)) return [];
 
       const results: RawSearchResult[] = [];
       for (const item of items) {
@@ -135,10 +121,8 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         });
       }
 
-      this.debugLog.push(`ddg-api: ${results.length} results`);
       return results;
-    } catch (e: any) {
-      this.debugLog.push(`ddg-api: error ${e.message}`);
+    } catch {
       return [];
     }
   }
@@ -156,10 +140,7 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         body: params.toString(),
       });
 
-      if (!res.ok) {
-        this.debugLog.push(`ddg-lite: ${res.status}`);
-        return [];
-      }
+      if (!res.ok) return [];
 
       const html = await res.text();
       const results: RawSearchResult[] = [];
@@ -187,10 +168,8 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         results.push({ title: links[i].title, url, snippet: snippets[i] || '' });
       }
 
-      this.debugLog.push(`ddg-lite: ${results.length} results (html: ${html.length})`);
       return results;
-    } catch (e: any) {
-      this.debugLog.push(`ddg-lite: error ${e.message}`);
+    } catch {
       return [];
     }
   }
@@ -224,10 +203,7 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         },
       });
 
-      if (!res.ok) {
-        this.debugLog.push(`bing: ${res.status}`);
-        return [];
-      }
+      if (!res.ok) return [];
 
       const html = await res.text();
       const results: RawSearchResult[] = [];
@@ -249,10 +225,8 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         }
       }
 
-      this.debugLog.push(`bing: ${results.length} results (html: ${html.length})`);
       return results;
-    } catch (e: any) {
-      this.debugLog.push(`bing: error ${e.message}`);
+    } catch {
       return [];
     }
   }
@@ -273,10 +247,7 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         },
       });
 
-      if (!res.ok) {
-        this.debugLog.push(`google: ${res.status}`);
-        return [];
-      }
+      if (!res.ok) return [];
 
       const html = await res.text();
       const results: RawSearchResult[] = [];
@@ -312,10 +283,8 @@ class DuckDuckGoSearchEngine implements SearchEngine {
         }
       }
 
-      this.debugLog.push(`google: ${results.length} results (html: ${html.length})`);
       return results;
-    } catch (e: any) {
-      this.debugLog.push(`google: error ${e.message}`);
+    } catch {
       return [];
     }
   }
@@ -523,14 +492,6 @@ const engine = createSearchEngine();
 export async function searchWeb(query: WebSearchQuery): Promise<WebSearchResponse> {
   const rawResults = await engine.search(query);
   const response = formatBraveResponse(query, rawResults);
-
-  // Include debug info when results are empty (helps diagnose serverless issues)
-  if (rawResults.length === 0 && engine instanceof DuckDuckGoSearchEngine) {
-    (response as any)._debug = {
-      engine: config.searchEngine.type,
-      attempts: engine.getDebugLog(),
-    };
-  }
 
   // Scrape page content if requested
   if (query.scrape && response.web.results.length > 0) {
