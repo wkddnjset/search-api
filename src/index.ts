@@ -12,7 +12,11 @@ app.use('/res/v1', rateLimitMiddleware);
 app.use('/res/v1/web', webSearchRouter);
 app.use(errorHandler);
 
-app.listen(config.port, () => {
-  console.log(`Search API server running on port ${config.port}`);
-  console.log(`Search engine: ${config.searchEngine.type}`);
-});
+if (process.env.VERCEL !== '1') {
+  app.listen(config.port, () => {
+    console.log(`Search API server running on port ${config.port}`);
+    console.log(`Search engine: ${config.searchEngine.type}`);
+  });
+}
+
+export default app;
